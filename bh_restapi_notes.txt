@@ -1,0 +1,79 @@
+
+To use the Bullhorn REST API - you need to request access from
+Bullhorn customer support.  They will create a specific user ID and
+provide you with a Client ID and Client Secret.  You assign the
+password for the user ID.  See the email below from Bullhorn 
+
+The Client ID and Client Secret are required for authentication
+(OAuth2) to use the REST API.  See the links in the email below for
+more info and see Bullhorn.pm and the specific functions:
+   get_auth_code
+   get_access_token
+   refresh_access_token
+   check_access_token
+   login
+
+
+
+
+
+Hi Joe Developer,
+
+Congratulations! Your setup to access the REST API is complete. Here
+are your new credentials:
+
+ 
+Client ID:     [CLIENT ID assigned by Bullhorn in the form of a UUID]
+Client Secret: [CLIENT SECRET assigned by Bullhorn - long random string]
+API Username:  [API User ID assigned by Bullhorn]
+API Password: You will need to generate a password for your developer.
+
+To do this:
+
+     1. Log into Bullhorn and navigate to menu > tools > users
+     2. Locate the username listed above in your userlist and open the
+        user record.
+     
+     3. Generate a new password for the user and provide that password
+        to your developer.
+     
+
+Note: You will still be required to use your API username and password
+in the authentication process (included above).
+
+ 
+Please take a moment to review these additional resources:
+ 
+Bullhorn Developer Site
+http://developer.bullhorn.com/
+ 
+REST Reference Documentation
+http://developer.bullhorn.com/sites/default/files/BullhornRESTAPI_0.pdf
+ 
+Getting Started with the Bullhorn REST API
+http://developer.bullhorn.com/articles/getting_started
+ 
+Articles and Samples
+http://developer.bullhorn.com/articles
+ 
+Developer Forum
+http://supportforums.bullhorn.com/viewforum.php?f=104
+ 
+If you have any questions or technical issues regarding the Bullhorn
+APIs, an authorized contact should contact Bullhorn Support by calling
+or submitting a ticket through the Resource Center. If you would like
+to authorize your developer to submit tickets on your behalf, please
+contact Bullhorn Support.
+
+
+Best Regards,
+
+Bullhorn Support Person
+Technical Support Analyst
+
+Bullhorn Support US: 617-478-9126
+Bullhorn Support UK: 44 800 032 2848, ext. 9131
+Bullhorn Support Australia: 61 28 073 5089
+Bullhorn Support International: 617-478-9131
+ref:_00DU0YOky._5000PXkNWp:ref
+
