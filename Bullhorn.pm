@@ -72,6 +72,8 @@ sub new {
              http_timeout   => 30,
              http_proxy     => '',
              https_proxy    => '',
+             oauth_url      => '',
+             rest_url       => '',
              auth_code      => '',
              access_href    => { },
              access_ts      => 0,
@@ -110,8 +112,10 @@ sub new {
 
    $ua->timeout( $d->{http_timeout} );
 
-   #$ua->proxy( 'http',  $d->{http_proxy} )   if $d->{http_proxy}   ne "";
-   #$ua->proxy( 'https', $d->{https_proxy} )  if $d->{https_proxy}  ne "";
+
+   # Proxy Setup
+   #$ua->proxy( 'http',  $d->{http_proxy} )  if $d->{http_proxy}  ne "";
+   #$ua->proxy( 'https', $d->{https_proxy} ) if $d->{https_proxy} ne "";
 
    #$req->proxy_authorization_basic("", "");
    
@@ -123,8 +127,7 @@ sub new {
    #$ENV{HTTPS_PROXY_PASSWORD}      = '';
 
    
-   $d->{ua} = $ua;
-   
+   $d->{ua} = $ua;   
    
    
    return bless $d, 'Bullhorn';
@@ -209,17 +212,52 @@ sub dump_debug {
 #
 # DESC:  Get Authorization Code for BH REST API
 #
+#
+# The first call is a GET to the URL below which nicludes the USER ID
+# assigned by Bullhorn for the REST API.  This returns the JSON below
+# which contains various URLs - we are interested in oauthUrl and restUrl
+# These are used to make calls to get/refresh the access token and login.
+# If these URLs are not used then Bullhorn servers may redirect HTTP
+# calls by returning a 307 code with a Location which this lib would
+# have to handle.
+#
+# Once logged in another restUrl will be returned and set in
+# login_href and it will be used for all other REST API calls.
+#
+#
+# https://rest.bullhornstaffing.com/rest-services/loginInfo?username=trc.restapi
+#
+# {
+#  "atsUrl":"https://cls33.bullhornstaffing.com",
+#  "billingSyncUrl":"https://wfr-west.bullhornstaffing.com/billing-sync-services",
+#  "coreUrl":"https://cls33.bullhornstaffing.com/core",
+#  "documentEditorUrl":"https://docs-east.bullhornstaffing.com/document/",
+#  "mobileUrl":"https://m-west.bullhorn.com",
+#  "oauthUrl":"https://auth-west.bullhornstaffing.com/oauth",
+#  "restUrl":"https://rest-west.bullhornstaffing.com/rest-services",
+#  "samlUrl":"http://cls33.bullhornstaffing.com/BullhornStaffing/SAML/Login.cfm",
+#  "novoUrl":"https://app.bullhornstaffing.com",
+#  "pulseInboxUrl":"https://pulse-inbox.bullhornstaffing.com",
+#  "canvasUrl":"https://lasbigateway.bullhorn.com/canvas/cgi-bin/cognosisapi.dll",
+#  "npsSurveyUrl":"https://surveys-west.bullhorn.com{{path}}?sl=33&{{params}}",
+#  "ulUrl":"https://lasuniversal.bullhornstaffing.com/universal-login",
+#  "dataCenterId":3,
+#  "superClusterId":33
+# }
+#
+#
+#
+# The second call should redirect back to the provided URL since that
+# is the address we gave BH during setup of the API user.
+# So we need to check the previous header to get 'Location'
+# and get the auth code from the query string where param = 'code'
+#
 # https://auth.bullhornstaffing.com/oauth/authorize?
 #    client_id=<CLIENT ID>
 #    response_type=code
 #    username=<USER ID>
 #    password=<PASSWORD>
 #    action=Login
-#
-# Calling this should redirect back to the provided URL since that
-# is the address we gave BH during setup of the API user.
-# So we need to check the previous header to get 'Location'
-# and get the auth code from the query string where param = 'code'
 #
 #
 # ARGS:  
@@ -233,35 +271,124 @@ sub dump_debug {
 sub get_auth_code {
    my ($self) = @_;
 
+   my $func = "get_auth_code";
+   
    if( $self->{client_id} eq "") {
-      $self->add_error("get_auth_code: client_id not defined");
+      $self->add_error("$func: client_id not defined");
       return 1;
    }
 
    if( $self->{user_id} eq "") {
-      $self->add_error("get_auth_code: user_id not defined");
+      $self->add_error("$func: user_id not defined");
       return 1;
    }
 
    if( $self->{user_pw} eq "") {
-      $self->add_error("get_auth_code: user_pw not defined");
+      $self->add_error("$func: user_pw not defined");
       return 1;
    }
 
+
+   #------------------------------------------------------------
+   # Call Bullhorn loginInfo to get URLs to use
+   #------------------------------------------------------------   
+   my $rest_url = "https://rest.bullhornstaffing.com/rest-services";
+   $rest_url = $self->{rest_url} if $self->{rest_url} ne "";
    
+   my $url_info =
+       $rest_url . "/loginInfo?username=" . $self->{user_id};
+
+   $self->add_debug("$func: URL INFO = $url_info" . "\n")
+       if $self->{debug_http};
+   
+   my $req_info = HTTP::Request->new(GET => $url_info);
+
+   $self->add_debug("$func: HTTP REQUEST:\n" . 
+                    $req_info->as_string . "\n") if $self->{debug_http};
+
+   my $info_href = { };
+   
+   my $success = 0;
+   my $tries   = 0;
+   
+   # Allow multiple chances for success
+   while(! $success && $tries < $self->{retry_max}) {
+      $tries++;
+
+      my $res_info = $self->{ua}->request($req_info);
+
+      $self->add_debug(
+         "$func: HTTP RESPONSE:\n" . 
+         $res_info->as_string . "\n") if $self->{debug_http};
+   
+      my $info_href_json;
+      
+      if($res_info->is_success) {
+         $info_href_json = $res_info->content;
+         
+         $self->add_debug("$func: $info_href_json")
+             if $self->{debug_http};
+         
+         $info_href = $self->{json}->decode($info_href_json);
+         $success   = 1;
+
+         # If we had to retry, write a success msg to the error log
+         $self->add_error("$func: success on try $tries") if $tries > 1;
+      }
+      else {
+         $self->process_http_error($func, $req_info, $res_info, $tries);
+      }
+   }
+   
+
+   
+   # Assign OAuth and REST URLs
+   if( $info_href ) {
+      if( exists $info_href->{oauthUrl} &&
+          ($info_href->{oauthUrl} ne "") ) {
+         $self->{oauth_url} = $info_href->{oauthUrl};
+      }
+      
+      if( exists $info_href->{restUrl} &&
+          ($info_href->{restUrl} ne "") ) {
+         $self->{rest_url} = $info_href->{restUrl};
+      }
+   }
+   else {
+      $self->add_error("$func: ERROR: " .
+                       "Problem getting OAuth and REST URLs");
+   }
+
+
+   if( $self->{oauth_url} eq "" ) {
+      $self->add_error("$func: ERROR: OAuth URL is not set\n");
+      return 1;
+   }
+
+   if( $self->{rest_url} eq "" ) {
+      $self->add_error("$func: ERROR: REST URL is not set\n");
+      return 1;
+   }
+
+
+   
+   
+   #------------------------------------------------------------
+   # Make the call to Login
+   #------------------------------------------------------------
    my $url = 
-       qq(https://auth.bullhornstaffing.com/oauth/authorize) . "?" .
+       $self->{oauth_url} . "/authorize?" .
        qq(client_id=) . $self->{client_id} . "&" . 
        qq(response_type=code)              . "&" .
        qq(username=) . $self->{user_id}    . "&" .
        qq(password=) . $self->{user_pw}    . "&" . 
        qq(action=Login);
 
-   $self->add_debug("get_auth_code: URL = $url" . "\n") if $self->{debug_http};
+   $self->add_debug("$func: URL = $url" . "\n") if $self->{debug_http};
    
    my $req = HTTP::Request->new(GET => $url);
 
-   $self->add_debug("get_auth_code: HTTP REQUEST:\n" . 
+   $self->add_debug("$func: HTTP REQUEST:\n" . 
                     $req->as_string . "\n") if $self->{debug_http};
 
 
@@ -274,13 +401,13 @@ sub get_auth_code {
    
       my $res = $self->{ua}->request($req);
 
-      $self->add_debug("get_auth_code: HTTP RESPONSE:\n" . 
+      $self->add_debug("$func: HTTP RESPONSE:\n" . 
                        $res->as_string . "\n") if $self->{debug_http};
 
       if($res->is_success) {
          my $redirect_url = $res->previous->header('Location');
 
-         $self->add_debug("get_auth_code: LOC = $redirect_url")
+         $self->add_debug("$func: LOC = $redirect_url")
              if $self->{debug_http};
       
          if( $redirect_url =~ /code=(.*)\&/ ) {
@@ -290,33 +417,16 @@ sub get_auth_code {
          $success = 1;
 
          # If we had to retry, write a success msg to the error log
-         if($tries > 1) {
-            $self->add_error("get_auth_code: successful on try $tries");
-         }
+         $self->add_error("$func: success on try $tries") if $tries > 1;
       }
       else {
-         $self->add_error("get_auth_code: HTTP call failed");
-         $self->add_error("get_auth_code: ". $res->status_line);
-         $self->add_error("get_auth_code: try = $tries");
-
-         # If we don't already have this info in the debug log
-         # add it to the error log
-         if(! $self->{debug_http}) {
-            $self->add_error("get_auth_code: HTTP REQUEST:\n" . 
-                             $req->as_string . "\n");
-            $self->add_error("get_auth_code: HTTP RESPONSE:\n" . 
-                             $res->as_string . "\n");
-         }
-
-         # Pause before trying again
-         sleep $self->{retry_wait} if $tries < $self->{retry_max};
+         $self->process_http_error($func, $req, $res, $tries);
       }
    }
-
    
    
    if( $self->{auth_code} eq "" ) {
-      $self->add_error("get_auth_code: Did not get auth code");
+      $self->add_error("$func: ERROR: Did not get auth code");
       return 1;
    }
    
@@ -361,18 +471,20 @@ sub get_auth_code {
 sub get_access_token {
    my ($self) = @_;
 
+   my $func = "get_access_token";
+   
    if( $self->{client_id} eq "") {
-      $self->add_error("get_access_token: client_id not defined");
+      $self->add_error("$func: client_id not defined");
       return 1;
    }
 
    if( $self->{client_secret} eq "") {
-      $self->add_error("get_access_token: client_secret not defined");
+      $self->add_error("$func: client_secret not defined");
       return 1;
    }
    
    if( $self->{auth_code} eq "") {
-      $self->add_error("get_access_token: auth_code not defined");
+      $self->add_error("$func: auth_code not defined");
       return 1;
    }
 
@@ -382,18 +494,18 @@ sub get_access_token {
 
 
    my $url = 
-       qq(https://auth.bullhornstaffing.com/oauth/token) . "?" .
+       $self->{oauth_url} . "/token?" .
        qq(grant_type=authorization_code)                 . "&" .
        qq(code=) . $self->{auth_code}                    . "&" . 
        qq(client_id=) . $self->{client_id}               . "&" .
        qq(client_secret=) . $self->{client_secret};
 
-   $self->add_debug("get_access_token: URL = $url" . "\n")
+   $self->add_debug("$func: URL = $url" . "\n")
        if $self->{debug_http};
    
    my $req = HTTP::Request->new(POST => $url);
 
-   $self->add_debug("get_access_token: HTTP REQUEST:\n" . 
+   $self->add_debug("$func: HTTP REQUEST:\n" . 
                     $req->as_string . "\n") if $self->{debug_http};
 
 
@@ -406,7 +518,7 @@ sub get_access_token {
 
       my $res = $self->{ua}->request($req);
 
-      $self->add_debug("get_access_token: HTTP RESPONSE:\n" . 
+      $self->add_debug("$func: HTTP RESPONSE:\n" . 
                        $res->as_string . "\n") if $self->{debug_http};
    
       my $access_href_json;
@@ -414,7 +526,7 @@ sub get_access_token {
       if($res->is_success) {
          $access_href_json = $res->content;
          
-         $self->add_debug("get_access_token: $access_href_json")
+         $self->add_debug("$func: $access_href_json")
              if $self->{debug_http};
          
          $self->{access_href} = $self->{json}->decode($access_href_json);
@@ -422,34 +534,17 @@ sub get_access_token {
          $success = 1;
 
          # If we had to retry, write a success msg to the error log
-         if($tries > 1) {
-            $self->add_error("get_access_token: successful on try $tries");
-         }
+         $self->add_error("$func: success on try $tries") if $tries > 1;
       }
       else {
-         $self->add_error("get_access_token: HTTP call failed");
-         $self->add_error("get_access_token: ". $res->status_line);
-         $self->add_error("get_access_token: try = $tries");
-
-         # If we don't already have this info in the debug log
-         # add it to the error log
-         if(! $self->{debug_http}) {
-            $self->add_error("get_access_token: HTTP REQUEST:\n" . 
-                             $req->as_string . "\n");
-            $self->add_error("get_access_token: HTTP RESPONSE:\n" . 
-                             $res->as_string . "\n");
-         }
-      
-         # Pause before trying again
-         sleep $self->{retry_wait} if $tries < $self->{retry_max};
+         $self->process_http_error($func, $req, $res, $tries);
       }
    }
    
 
-
    if( (! exists $self->{access_href}->{access_token} ) ||
        ($self->{access_href}->{access_token} eq "")  ) {
-      $self->add_error("get_access_token: Did not get access_token");
+      $self->add_error("$func: ERROR: Did not get access_token");
       return 1;
    }
 
@@ -499,18 +594,20 @@ sub get_access_token {
 sub refresh_access_token {
    my ($self) = @_;
 
+   my $func = "refresh_access_token";
+   
    if( $self->{client_id} eq "") {
-      $self->add_error("refresh_access_token: client_id not defined");
+      $self->add_error("$func: client_id not defined");
       return 1;
    }
 
    if( $self->{client_secret} eq "") {
-      $self->add_error("refresh_access_token: client_secret not defined");
+      $self->add_error("$func: client_secret not defined");
       return 1;
    }
    
    if( $self->{access_href}->{refresh_token} eq "") {
-      $self->add_error("refresh_access_token: refresh_token not defined");
+      $self->add_error("$func: refresh_token not defined");
       return 1;
    }
 
@@ -520,18 +617,18 @@ sub refresh_access_token {
 
 
    my $url = 
-       qq(https://auth.bullhornstaffing.com/oauth/token)          . "?" .
+       $self->{oauth_url} . "/token?" .
        qq(grant_type=refresh_token)                               . "&" .
        qq(refresh_token=) . $self->{access_href}->{refresh_token} . "&" . 
        qq(client_id=) . $self->{client_id}                        . "&" .
        qq(client_secret=) . $self->{client_secret};
 
-   $self->add_debug("refresh_access_token: URL = $url" . "\n")
+   $self->add_debug("$func: URL = $url" . "\n")
        if $self->{debug_http};
    
    my $req = HTTP::Request->new(POST => $url);
 
-   $self->add_debug("refresh_access_token: HTTP REQUEST:\n" . 
+   $self->add_debug("$func: HTTP REQUEST:\n" . 
                     $req->as_string . "\n") if $self->{debug_http};
 
 
@@ -547,7 +644,7 @@ sub refresh_access_token {
       if($res->is_success) {
          my $access_href_json = $res->content;
          
-         $self->add_debug("refresh_access_token: $access_href_json")
+         $self->add_debug("$func: $access_href_json")
              if $self->{debug_http};
          
          $self->{access_href} = $self->{json}->decode($access_href_json);
@@ -555,33 +652,17 @@ sub refresh_access_token {
          $success = 1;
 
          # If we had to retry, write a success msg to the error log
-         if($tries > 1) {
-            $self->add_error("refresh_access_token: successful on try $tries");
-         }
+         $self->add_error("$func: success on try $tries") if $tries > 1;
       }
       else {
-         $self->add_error("refresh_access_token: HTTP call failed");
-         $self->add_error("refresh_access_token: ". $res->status_line);
-         $self->add_error("refresh_access_token: try = $tries");
-
-         # If we don't already have this info in the debug log
-         # add it to the error log
-         if(! $self->{debug_http}) {
-            $self->add_error("refresh_access_token: HTTP REQUEST:\n" . 
-                             $req->as_string . "\n");
-            $self->add_error("refresh_access_token: HTTP RESPONSE:\n" . 
-                             $res->as_string . "\n");
-         }
-      
-         # Pause before trying again
-         sleep $self->{retry_wait} if $tries < $self->{retry_max};
+         $self->process_http_error($func, $req, $res, $tries);
       }
    }
 
    
    if( (! exists $self->{access_href}->{access_token} ) ||
        ($self->{access_href}->{access_token} eq "")  ) {
-      $self->add_error("refresh_access_token: Did not refresh access_token");
+      $self->add_error("$func: ERROR: Did not refresh access_token");
       return 1;
    }
 
@@ -614,18 +695,20 @@ sub refresh_access_token {
 sub check_access_token {
    my ($self) = @_;
 
+   my $func = "check_access_token";
+   
    # Determine how long we have been using the current token
    # Add 20 seconds 
    my $d = time - $self->{access_ts};
 
-   $self->add_debug("check_access_token: time diff = $d")
+   $self->add_debug("$func: time diff = $d")
        if $self->{debug_http};
    
    my $rc = 0;
 
    if( $d > ($self->{access_href}->{expires_in} - 20) ) {
       $rc = $self->refresh_access_token;      
-      $self->add_debug("check_access_token: refresh token - RET = $rc");      
+      $self->add_debug("$func: refresh token - RET = $rc");      
    }
        
    return $rc;
@@ -649,8 +732,8 @@ sub check_access_token {
 # Calling this returns JSON like this
 #
 # {
-#    "BhRestToken" : "8b92f340-5edf-5bfe-1c52-479f2cf3ea47",
-#    "restUrl" : "https://rest5.bullhornstaffing.com/rest-services/abc123/"
+#    "BhRestToken":"8b92f340-5edf-5bfe-1c52-479f2cf3ea47",
+#    "restUrl":"https://rest5.bullhornstaffing.com/rest-services/abc123/"
 #  }
 #
 #
@@ -665,22 +748,24 @@ sub check_access_token {
 sub login {
    my ($self) = @_;
 
+   my $func = "login";
+   
    if( $self->{access_href}->{access_token} eq "") {
-      $self->add_error("login: access_token not defined");
+      $self->add_error("$func: access_token not defined");
       return 1;
    }
 
 
-   my $url = 
-       qq(https://rest.bullhornstaffing.com/rest-services/login) . "?" .
+   my $url =
+       $self->{rest_url} . "/login?" .
        qq(version=*) . "&" .
        qq(access_token=) . $self->{access_href}->{access_token};
 
-   $self->add_debug("login: URL = $url" . "\n");
+   $self->add_debug("$func: URL = $url" . "\n");
    
    my $req = HTTP::Request->new(GET => $url);
 
-   $self->add_debug("login: HTTP REQUEST:\n" . 
+   $self->add_debug("$func: HTTP REQUEST:\n" . 
                     $req->as_string . "\n") if $self->{debug_http};
 
 
@@ -693,39 +778,23 @@ sub login {
    
       my $res = $self->{ua}->request($req);
 
-      $self->add_debug("login: HTTP RESPONSE:\n" . 
+      $self->add_debug("$func: HTTP RESPONSE:\n" . 
                        $res->as_string . "\n") if $self->{debug_http};
       
       if($res->is_success) {
          my $login_json = $res->content;
          
-         $self->add_debug("login: $login_json");
+         $self->add_debug("$func: $login_json");
          
          $self->{login_href} = $self->{json}->decode($login_json);
 
          $success = 1;
 
          # If we had to retry, write a success msg to the error log
-         if($tries > 1) {
-            $self->add_error("login: successful on try $tries");
-         }
+         $self->add_error("$func: success on try $tries") if $tries > 1;
       }
       else {
-         $self->add_error("login: HTTP call failed");
-         $self->add_error("login: " . $res->status_line);
-         $self->add_error("login: try = $tries");
-
-         # If we don't already have this info in the debug log
-         # add it to the error log
-         if(! $self->{debug_http}) {
-            $self->add_error("login: HTTP REQUEST:\n" . 
-                             $req->as_string . "\n");
-            $self->add_error("login: HTTP RESPONSE:\n" . 
-                             $res->as_string . "\n");
-         }
-      
-         # Pause before trying again
-         sleep $self->{retry_wait} if $tries < $self->{retry_max};
+         $self->process_http_error($func, $req, $res, $tries);
       }
    }
    
@@ -733,17 +802,155 @@ sub login {
    
    if( (! exists $self->{login_href}->{restUrl} ) ||
        ($self->{login_href}->{restUrl} eq "") ) {
-      $self->add_error("login: Did not get REST URL");
+      $self->add_error("$func: ERROR: Did not get REST URL");
       return 1;
    }
    elsif( (! exists $self->{login_href}->{BhRestToken} ) ||
           ($self->{login_href}->{BhRestToken} eq "")   ) {
-      $self->add_error("login: Did not get REST TOKEN");
+      $self->add_error("$func: ERROR: Did not get REST TOKEN");
       return 1;
    }
 
    
    return 0;
+}
+
+
+
+#----------------------------------------------------------------------
+#
+# NAME:  connect
+#
+# DESC:  Function to call the 3 main functions to 
+#        initiate the REST API for Bullhorn
+#
+# ARGS:  
+#
+# RETN:  0 - Success
+#        1 - Error   Check $self->{error_log}
+#
+# HIST:  
+#
+#----------------------------------------------------------------------
+sub connect {
+   my ($self) = @_;
+
+   my $rc;
+
+   $rc = $self->get_auth_code;
+   return $rc if $rc;
+
+   $rc = $self->get_access_token;
+   return $rc if $rc;
+
+   $rc = $self->login;
+   return $rc if $rc;
+
+   return 0;
+}
+
+
+
+
+#----------------------------------------------------------------------
+#
+# NAME:  meta_entity
+#
+# DESC:  Get the meta data for an Entity
+#
+# https://rest5.bullhornstaffing.com/rest-services/abc123/
+#     meta/Candidate?
+#     BhRestToken=74e6ae9b-b5c2-41d0-867f-f6b7a36f16db
+#
+#
+# ARGS: entity - BH entity name
+#       fields - comma delim list of fields to return
+#
+# RETN:  
+#
+# HIST:  
+#
+#----------------------------------------------------------------------
+sub meta_entity {
+   my ($self, $entity, $fields) = @_;
+
+   my $func = "meta_entity";
+   
+   if( $self->{login_href}->{restUrl} eq "") {
+      $self->add_error("$func: restUrl not defined");
+      return undef;
+   }
+
+   if( $self->{login_href}->{BhRestToken} eq "") {
+      $self->add_error("$func: BhRestToken not defined");
+      return undef;
+   }
+
+   if( $entity eq "") {
+      $self->add_error("$func: entity not defined");
+      return undef;
+   }
+
+
+   # Check if the access token needs to be refreshed
+   if($self->check_access_token) {
+      $self->add_error("$func: Problem checking access token");
+      return undef;
+   }
+
+
+   my $get = undef;
+   
+   my $url = 
+       $self->{login_href}->{restUrl} . qq(meta/$entity) . "?" .
+       qq(BhRestToken=) . $self->{login_href}->{BhRestToken};
+   
+   $url .= "&" . qq(fields=$fields)   if $fields ne "";
+   
+   $self->add_debug("$func: URL = $url" . "\n");
+
+   my $req = HTTP::Request->new(GET => $url);
+
+   $self->add_debug("$func: HTTP REQUEST:\n" . 
+                    $req->as_string . "\n") if $self->{debug_http};
+      
+
+   my $success = 0;
+   my $tries   = 0;
+
+   # Allow multiple chances for success
+   while(! $success && $tries < $self->{retry_max}) {
+      $tries++;
+
+      my $res = $self->{ua}->request($req);
+      
+      $self->add_debug("$func: HTTP RESPONSE:\n" . 
+                       $res->as_string . "\n") if $self->{debug_http};
+      
+      if($res->is_success) {
+         my $get_json = $res->content;
+         
+         $self->add_debug("$func: $get_json")  if $self->{debug_http};
+         
+         $get = $self->{json}->decode($get_json);
+
+         $success = 1;
+
+         # If we had to retry, write a success msg to the error log
+         $self->add_error("$func: success on try $tries") if $tries > 1;
+      }
+      else {
+         $self->process_http_error($func, $req, $res, $tries);
+      }
+   }
+
+   
+   if( ! exists $get->{data} ) {
+      $self->add_error("$func: Did not get metadata for $entity");
+   }
+
+
+   return $get;
 }
 
 
@@ -796,25 +1003,37 @@ sub login {
 sub get_entity {
    my ($self, $entity, $id, $fields) = @_;
 
+   my $func = "get_entity";
+   
    if( $self->{login_href}->{restUrl} eq "") {
-      $self->add_error("get_entity: restUrl not defined");
+      $self->add_error("$func: restUrl not defined");
       return undef;
    }
 
    if( $self->{login_href}->{BhRestToken} eq "") {
-      $self->add_error("get_entity: BhRestToken not defined");
+      $self->add_error("$func: BhRestToken not defined");
       return undef;
    }
 
    if( $entity eq "") {
-      $self->add_error("get_entity: entity not defined");
+      $self->add_error("$func: entity not defined");
+      return undef;
+   }
+
+   if( $fields eq "") {
+      $self->add_error("$func: fields not defined");
+      return undef;
+   }
+   
+   if( $fields eq "*") {
+      $self->add_error("$func: Cannot use '*' for fields");
       return undef;
    }
 
 
    # Check if the access token needs to be refreshed
    if($self->check_access_token) {
-      $self->add_error("get_entity: Problem checking access token");
+      $self->add_error("$func: Problem checking access token");
       return undef;
    }
 
@@ -827,11 +1046,11 @@ sub get_entity {
    
    $url .= "&" . qq(fields=$fields)   if $fields ne "";
    
-   $self->add_debug("get_entity: URL = $url" . "\n");
+   $self->add_debug("$func: URL = $url" . "\n");
 
    my $req = HTTP::Request->new(GET => $url);
 
-   $self->add_debug("get_entity: HTTP REQUEST:\n" . 
+   $self->add_debug("$func: HTTP REQUEST:\n" . 
                     $req->as_string . "\n") if $self->{debug_http};
       
 
@@ -844,45 +1063,29 @@ sub get_entity {
 
       my $res = $self->{ua}->request($req);
       
-      $self->add_debug("get_entity: HTTP RESPONSE:\n" . 
+      $self->add_debug("$func: HTTP RESPONSE:\n" . 
                        $res->as_string . "\n") if $self->{debug_http};
       
       if($res->is_success) {
          my $get_json = $res->content;
          
-         $self->add_debug("get_entity: $get_json")  if $self->{debug_http};
+         $self->add_debug("$func: $get_json")  if $self->{debug_http};
          
          $get = $self->{json}->decode($get_json);
 
          $success = 1;
 
          # If we had to retry, write a success msg to the error log
-         if($tries > 1) {
-            $self->add_error("get_entity: successful on try $tries");
-         }
+         $self->add_error("$func: success on try $tries") if $tries > 1;
       }
       else {
-         $self->add_error("get_entity: HTTP call failed");
-         $self->add_error("get_entity: ". $res->status_line);
-         $self->add_error("get_entity: try = $tries");
-
-         # If we don't already have this info in the debug log
-         # add it to the error log
-         if(! $self->{debug_http}) {
-            $self->add_error("get_entity: HTTP REQUEST:\n" . 
-                             $req->as_string . "\n");
-            $self->add_error("get_entity: HTTP RESPONSE:\n" . 
-                             $res->as_string . "\n");
-         }
-      
-         # Pause before trying again
-         sleep $self->{retry_wait} if $tries < $self->{retry_max};
+         $self->process_http_error($func, $req, $res, $tries);
       }
    }
 
    
    if( ! exists $get->{data} ) {
-      $self->add_error("get_entity: Did not get info for $entity ($id)");
+      $self->add_error("$func: Did not get info for $entity ($id)");
    }
 
 
@@ -916,21 +1119,33 @@ sub get_entity {
 sub get_entity_files {
    my ($self, $entity, $id, $fields) = @_;
 
+   my $func = "get_entity_files";
+   
    if( $self->{login_href}->{restUrl} eq "") {
-      $self->add_error("get_entity_files: restUrl not defined");
+      $self->add_error("$func: restUrl not defined");
       return undef;
    }
 
    if( $self->{login_href}->{BhRestToken} eq "") {
-      $self->add_error("get_entity_files: BhRestToken not defined");
+      $self->add_error("$func: BhRestToken not defined");
       return undef;
    }
 
    if( $entity eq "") {
-      $self->add_error("get_entity_files: entity not defined");
+      $self->add_error("$func: entity not defined");
       return undef;
    }
 
+   if( $fields eq "") {
+      $self->add_error("$func: fields not defined");
+      return undef;
+   }
+
+   if( $fields eq "*") {
+      $self->add_error("$func: Cannot use '*' for fields");
+      return undef;
+   }
+   
    if( $id eq "") {
       $self->add_error("get_file: Entity ID not defined");
       return undef;
@@ -939,7 +1154,7 @@ sub get_entity_files {
 
    # Check if the access token needs to be refreshed
    if($self->check_access_token) {
-      $self->add_error("get_entity_files: Problem checking access token");
+      $self->add_error("$func: Problem checking access token");
       return undef;
    }
 
@@ -953,11 +1168,11 @@ sub get_entity_files {
 
    $url .= "&" . qq(fields=$fields)   if $fields ne "";
    
-   $self->add_debug("get_entity_files: URL = $url" . "\n");
+   $self->add_debug("$func: URL = $url" . "\n");
    
    my $req = HTTP::Request->new(GET => $url);
 
-   $self->add_debug("get_entity_files: HTTP REQUEST:\n" . 
+   $self->add_debug("$func: HTTP REQUEST:\n" . 
                     $req->as_string . "\n") if $self->{debug_http};
 
 
@@ -970,45 +1185,29 @@ sub get_entity_files {
 
       my $res = $self->{ua}->request($req);
 
-      $self->add_debug("get_entity_files: HTTP RESPONSE:\n" . 
+      $self->add_debug("$func: HTTP RESPONSE:\n" . 
                        $res->as_string . "\n") if $self->{debug_http};
       
       if($res->is_success) {
          my $get_json = $res->content;
          
-         $self->add_debug("get_entity_files: $get_json");
+         $self->add_debug("$func: $get_json");
          
          $get = $self->{json}->decode($get_json);
 
          $success = 1;
 
          # If we had to retry, write a success msg to the error log
-         if($tries > 1) {
-            $self->add_error("get_entity_files: successful on try $tries");
-         }
+         $self->add_error("$func: success on try $tries") if $tries > 1;
       }
       else {
-         $self->add_error("get_entity_files: HTTP call failed");
-         $self->add_error("get_entity_files: ". $res->status_line);
-         $self->add_error("get_entity_files: try = $tries");
-
-         # If we don't already have this info in the debug log
-         # add it to the error log
-         if(! $self->{debug_http}) {
-            $self->add_error("get_entity_files: HTTP REQUEST:\n" . 
-                             $req->as_string . "\n");
-            $self->add_error("get_entity_files: HTTP RESPONSE:\n" . 
-                             $res->as_string . "\n");
-         }
-      
-         # Pause before trying again
-         sleep $self->{retry_wait} if $tries < $self->{retry_max};
+         $self->process_http_error($func, $req, $res, $tries);
       }
    }
 
    
    if( ! exists $get->{data} ) {
-      $self->add_error("get_entity_files: Did not get files for $entity ($id)");
+      $self->add_error("$func: Did not get files for $entity ($id)");
    }
 
 
@@ -1043,35 +1242,37 @@ sub get_entity_files {
 sub get_file {
    my ($self, $entity, $id, $fileid) = @_;
 
+   my $func = "get_file";
+   
    if( $self->{login_href}->{restUrl} eq "") {
-      $self->add_error("get_file: restUrl not defined");
+      $self->add_error("$func: restUrl not defined");
       return undef;
    }
 
    if( $self->{login_href}->{BhRestToken} eq "") {
-      $self->add_error("get_file: BhRestToken not defined");
+      $self->add_error("$func: BhRestToken not defined");
       return undef;
    }
 
    if( $entity eq "") {
-      $self->add_error("get_file: entity not defined");
+      $self->add_error("$func: entity not defined");
       return undef;
    }
 
    if( $id eq "") {
-      $self->add_error("get_file: Entity ID not defined");
+      $self->add_error("$func: Entity ID not defined");
       return undef;
    }
 
    if( $fileid eq "") {
-      $self->add_error("get_file: File ID not defined");
+      $self->add_error("$func: File ID not defined");
       return undef;
    }
 
 
    # Check if the access token needs to be refreshed
    if($self->check_access_token) {
-      $self->add_error("get_file: Problem checking access token");
+      $self->add_error("$func: Problem checking access token");
       return undef;
    }
 
@@ -1083,12 +1284,12 @@ sub get_file {
        qq(file/$entity/$id/$fileid) . "?" .
        qq(BhRestToken=) . $self->{login_href}->{BhRestToken};
 
-   $self->add_debug("get_file: URL = $url" . "\n");
+   $self->add_debug("$func: URL = $url" . "\n");
    
 
    my $req = HTTP::Request->new(GET => $url);
 
-   $self->add_debug("get_file: HTTP REQUEST:\n" . 
+   $self->add_debug("$func: HTTP REQUEST:\n" . 
                     $req->as_string . "\n") if $self->{debug_http};
 
 
@@ -1101,39 +1302,23 @@ sub get_file {
       
       my $res = $self->{ua}->request($req);
 
-      $self->add_debug("get_file: HTTP RESPONSE:\n" . 
+      $self->add_debug("$func: HTTP RESPONSE:\n" . 
                        $res->as_string . "\n") if $self->{debug_http};
       
       if($res->is_success) {
          my $get_json = $res->content;
          
-         $self->add_debug("get_file: $get_json");
+         $self->add_debug("$func: $get_json");
          
          $get = $self->{json}->decode($get_json);
 
          $success = 1;
 
          # If we had to retry, write a success msg to the error log
-         if($tries > 1) {
-            $self->add_error("get_file: successful on try $tries");
-         }
+         $self->add_error("$func: success on try $tries") if $tries > 1;
       }
       else {
-         $self->add_error("get_file: HTTP call failed");
-         $self->add_error("get_file: ". $res->status_line);
-         $self->add_error("get_file: try = $tries");
-
-         # If we don't already have this info in the debug log
-         # add it to the error log
-         if(! $self->{debug_http}) {
-            $self->add_error("get_file: HTTP REQUEST:\n" . 
-                             $req->as_string . "\n");
-            $self->add_error("get_file: HTTP RESPONSE:\n" . 
-                             $res->as_string . "\n");
-         }
-      
-         # Pause before trying again
-         sleep $self->{retry_wait} if $tries < $self->{retry_max};
+         $self->process_http_error($func, $req, $res, $tries);
       }
    }
 
@@ -1152,7 +1337,8 @@ sub get_file {
 #
 # DESC:  Search for an Entity
 #
-# https://rest5.bullhornstaffing.com/rest-services/abc123/search/Candidate?
+# https://rest5.bullhornstaffing.com/rest-services/abc123/
+#     search/Candidate?
 #     BhRestToken=74e6ae3c-b5c2-41d3-867f-f6b7a36f16ef
 #     query=email:"joe@gmail.com"
 #     fields=firstName,lastName,address,email
@@ -1201,30 +1387,42 @@ sub get_file {
 sub search_entity {
    my ($self, $entity, $query, $fields, $sort, $count, $start) = @_;
 
+   my $func = "search_entity";
+   
    if( $self->{login_href}->{restUrl} eq "") {
-      $self->add_error("search_entity: restUrl not defined");
+      $self->add_error("$func: restUrl not defined");
       return undef;
    }
 
    if( $self->{login_href}->{BhRestToken} eq "") {
-      $self->add_error("search_entity: BhRestToken not defined");
+      $self->add_error("$func: BhRestToken not defined");
       return undef;
    }
 
    if( $entity eq "") {
-      $self->add_error("search_entity: entity not defined");
+      $self->add_error("$func: entity not defined");
       return undef;
    }
 
+   if( $fields eq "") {
+      $self->add_error("$func: fields not defined");
+      return undef;
+   }
+
+   if( $fields eq "*") {
+      $self->add_error("$func: Cannot use '*' for fields");
+      return undef;
+   }
+   
    if( $query eq "") {
-      $self->add_error("search_entity: query not defined");
+      $self->add_error("$func: query not defined");
       return undef;
    }
 
 
    # Check if the access token needs to be refreshed
    if($self->check_access_token) {
-      $self->add_error("search_entity: Problem checking access token");
+      $self->add_error("$func: Problem checking access token");
       return undef;
    }
 
@@ -1241,11 +1439,11 @@ sub search_entity {
    $url .= "&" . qq(count=$count)     if $count  ne "";
    $url .= "&" . qq(start=$start)     if $start  ne "";
    
-   $self->add_debug("search_entity: URL = $url" . "\n") if $self->{debug_http};
+   $self->add_debug("$func: URL = $url" . "\n") if $self->{debug_http};
    
    my $req = HTTP::Request->new(GET => $url);
 
-   $self->add_debug("search_entity: HTTP REQUEST:\n" . 
+   $self->add_debug("$func: HTTP REQUEST:\n" . 
                     $req->as_string . "\n") if $self->{debug_http};
 
 
@@ -1258,45 +1456,29 @@ sub search_entity {
       
       my $res = $self->{ua}->request($req);
       
-      $self->add_debug("search_entity: HTTP RESPONSE:\n" . 
+      $self->add_debug("$func: HTTP RESPONSE:\n" . 
                        $res->as_string . "\n") if $self->{debug_http};
       
       if($res->is_success) {
          my $search_json = $res->content;
          
-         $self->add_debug("search_entity: $search_json") if $self->{debug_http};
+         $self->add_debug("$func: $search_json") if $self->{debug_http};
          
          $search  = $self->{json}->decode($search_json);
 
          $success = 1;
 
          # If we had to retry, write a success msg to the error log
-         if($tries > 1) {
-            $self->add_error("search_entity: successful on try $tries");
-         }
+         $self->add_error("$func: success on try $tries") if $tries > 1;
       }
       else {
-         $self->add_error("search_entity: HTTP call failed");
-         $self->add_error("search_entity: ". $res->status_line);
-         
-         # If we don't already have this info in the debug log
-         # add it to the error log
-         if(! $self->{debug_http}) {
-            $self->add_error("search_entity: HTTP REQUEST:\n" . 
-                             $req->as_string . "\n");
-            $self->add_error("search_entity: HTTP RESPONSE:\n" . 
-                             $res->as_string . "\n");
-         }
-      
-
-         # Pause before trying again
-         sleep $self->{retry_wait} if $tries < $self->{retry_max};
+         $self->process_http_error($func, $req, $res, $tries);
       }
    }
 
    
    if( ! exists $search->{total} ) {
-      $self->add_error("search_entity: Did not get search info");
+      $self->add_error("$func: Did not get search info");
    }
 
 
@@ -1323,18 +1505,31 @@ sub search_entity {
 sub search_entity_id {
    my ($self, $type, $id, $fields) = @_;
 
+   my $func = "search_entity_id";
+   
    my $query = qq(id:"$id") if $id ne "";
 
    if( $type eq "") {
-      $self->add_error("search_entity_id: entity type not defined");
+      $self->add_error("$func: entity type not defined");
       return undef;
    }
    
    if( $query eq "") {
-      $self->add_error("search_entity_id: query is empty");
+      $self->add_error("$func: query is empty");
       return undef;
    }
-      
+
+   if( $fields eq "") {
+      $self->add_error("$func: fields not defined");
+      return undef;
+   }
+
+   if( $fields eq "*") {
+      $self->add_error("$func: Cannot use '*' for fields");
+      return undef;
+   }
+
+   
    return $self->search_entity($type, $query, $fields);
 }
 
@@ -1357,6 +1552,8 @@ sub search_entity_id {
 sub search_candidate_name {
    my ($self, $first, $last, $fields, $sort, $count, $start) = @_;
 
+   my $func = "search_candidate_name";
+   
    my $query = "";
 
    if($first ne "") {
@@ -1372,9 +1569,21 @@ sub search_candidate_name {
 
 
    if( $query eq "") {
-      $self->add_error("search_candidate_name: query is empty");
+      $self->add_error("$func: query is empty");
       return undef;
    }
+
+
+   if( $fields eq "") {
+      $self->add_error("$func: fields not defined");
+      return undef;
+   }
+
+   if( $fields eq "*") {
+      $self->add_error("$func: Cannot use '*' for fields");
+      return undef;
+   }
+
    
    
    return $self->search_entity("Candidate", $query, 
@@ -1399,13 +1608,27 @@ sub search_candidate_name {
 sub search_candidate_email {
    my ($self, $email, $fields, $sort, $count, $start) = @_;
 
+   my $func = "search_candidate_email";
+   
    if( $email eq "") {
-      $self->add_error("search_candidate_email: Email not defined");
+      $self->add_error("$func: Email not defined");
       return 1;
    }
 
    my $query = qq(email:"$email");
 
+
+   if( $fields eq "") {
+      $self->add_error("$func: fields not defined");
+      return undef;
+   }
+   
+   if( $fields eq "*") {
+      $self->add_error("$func: Cannot use '*' for fields");
+      return undef;
+   }
+
+   
    return $self->search_entity("Candidate", $query, 
                                $fields, $sort, $count, $start);
 }
@@ -1420,7 +1643,8 @@ sub search_candidate_email {
 #
 # DESC:  Query for an Entity
 #
-# https://rest5.bullhornstaffing.com/rest-services/abc123/query/Candidate?
+# https://rest5.bullhornstaffing.com/rest-services/abc123/
+#     query/Candidate?
 #     BhRestToken=74e6ae9b-c4c2-41d0-868e-f6b7a36f16ef
 #     where=id=%20337228%20AND%20status='Active'
 #     fields=firstName,lastName,address,email
@@ -1473,35 +1697,42 @@ sub search_candidate_email {
 sub query_entity {
    my ($self, $entity, $where, $fields, $orderby, $count, $start) = @_;
 
+   my $func = "query_entity";
+   
    if( $self->{login_href}->{restUrl} eq "") {
-      $self->add_error("query_entity: restUrl not defined");
+      $self->add_error("$func: restUrl not defined");
       return undef;
    }
 
    if( $self->{login_href}->{BhRestToken} eq "") {
-      $self->add_error("query_entity: BhRestToken not defined");
+      $self->add_error("$func: BhRestToken not defined");
       return undef;
    }
 
    if( $entity eq "") {
-      $self->add_error("query_entity: entity not defined");
+      $self->add_error("$func: entity not defined");
       return undef;
    }
 
    if( $where eq "") {
-      $self->add_error("query_entity: where clause not defined");
+      $self->add_error("$func: where clause not defined");
       return undef;
    }
 
    if( $fields eq "") {
-      $self->add_error("query_entity: fields not defined");
+      $self->add_error("$func: fields not defined");
+      return undef;
+   }
+
+   if( $fields eq "*") {
+      $self->add_error("$func: Cannot use '*' for fields");
       return undef;
    }
 
 
    # Check if the access token needs to be refreshed
    if($self->check_access_token) {
-      $self->add_error("query_entity: Problem checking access token");
+      $self->add_error("$func: Problem checking access token");
       return undef;
    }
    
@@ -1518,11 +1749,11 @@ sub query_entity {
    $url .= "&" . qq(count=$count)     if $count   ne "";
    $url .= "&" . qq(start=$start)     if $start   ne "";
    
-   $self->add_debug("query_entity: URL = $url" . "\n") if $self->{debug_http};
+   $self->add_debug("$func: URL = $url" . "\n") if $self->{debug_http};
    
    my $req = HTTP::Request->new(GET => $url);
 
-   $self->add_debug("query_entity: HTTP REQUEST:\n" . 
+   $self->add_debug("$func: HTTP REQUEST:\n" . 
                     $req->as_string . "\n") if $self->{debug_http};
 
 
@@ -1535,45 +1766,29 @@ sub query_entity {
       
       my $res = $self->{ua}->request($req);
       
-      $self->add_debug("query_entity: HTTP RESPONSE:\n" . 
+      $self->add_debug("$func: HTTP RESPONSE:\n" . 
                        $res->as_string . "\n") if $self->{debug_http};
       
       if($res->is_success) {
          my $query_json = $res->content;
          
-         $self->add_debug("query_entity: $query_json") if $self->{debug_http};
+         $self->add_debug("$func: $query_json") if $self->{debug_http};
          
          $query   = $self->{json}->decode($query_json);
 
          $success = 1;
 
          # If we had to retry, write a success msg to the error log
-         if($tries > 1) {
-            $self->add_error("query_entity: successful on try $tries");
-         }
+         $self->add_error("$func: success on try $tries") if $tries > 1;
       }
       else {
-         $self->add_error("query_entity: HTTP call failed");
-         $self->add_error("query_entity: ". $res->status_line);
-         $self->add_error("query_entity: try = $tries");
-         
-         # If we don't already have this info in the debug log
-         # add it to the error log.
-         if(! $self->{debug_http}) {
-            $self->add_error("query_entity: HTTP REQUEST:\n" . 
-                             $req->as_string . "\n");
-            $self->add_error("query_entity: HTTP RESPONSE:\n" . 
-                             $res->as_string . "\n");
-         }
-      
-         # Pause before trying again
-         sleep $self->{retry_wait} if $tries < $self->{retry_max};         
+         $self->process_http_error($func, $req, $res, $tries);
       }
    }
 
    
    if( ! exists $query->{count} ) {
-      $self->add_error("query_entity: Did not get query info");
+      $self->add_error("$func: Did not get query info");
    }
 
 
@@ -1598,18 +1813,31 @@ sub query_entity {
 sub query_entity_id {
    my ($self, $type, $id, $fields) = @_;
 
+   my $func = "query_entity_id";
+   
    my $query = qq(id=$id) if $id ne "";
 
    if( $type eq "") {
-      $self->add_error("query_entity_id: entity type not defined");
+      $self->add_error("$func: entity type not defined");
       return undef;
    }
    
    if( $query eq "") {
-      $self->add_error("query_entity_id: query is empty");
+      $self->add_error("$func: query is empty");
       return undef;
    }
-      
+
+   if( $fields eq "") {
+      $self->add_error("$func: fields not defined");
+      return undef;
+   }
+
+   if( $fields eq "*") {
+      $self->add_error("$func: Cannot use '*' for fields");
+      return undef;
+   }
+
+   
    return $self->query_entity($type, $query, $fields);
 }
 
@@ -1633,43 +1861,46 @@ sub query_entity_id {
 sub parse_resume {
    my ($self, $file) = @_;
 
+   my $func = "parse_resume";
+   
    if( ! -e $file ) {
-      $self->add_error("parse_resume: restUrl not defined");
+      $self->add_error("$func: restUrl not defined");
       return undef;
    }
 
    my $format = (split /\./, File::Basename::basename($file))[1];
 
    if( $format eq "" ) {
-      $self->add_error("parse_resume: format not defined");
+      $self->add_error("$func: format not defined");
       return undef;
    }
    
    if( ! grep /^$format$/i, qw(text html pdf doc docx rtf odt) ) {
-      $self->add_error("parse_resume: format not supported");
+      $self->add_error("$func: format not supported");
       return undef;
    }
 
 
    # Check if the access token needs to be refreshed
    if($self->check_access_token) {
-      $self->add_error("parse_resume: Problem checking access token");
+      $self->add_error("$func: Problem checking access token");
       return undef;
    }
       
    
    my $url = 
-       $self->{login_href}->{restUrl} . qq(resume/parseToCandidate) . "?" .
+       $self->{login_href}->{restUrl} .
+       qq(resume/parseToCandidate) . "?" .
        qq(BhRestToken=) . $self->{login_href}->{BhRestToken} . "&" .
        qq(format=$format);
 
-   $self->add_debug("parse_resume: URL = $url" . "\n") if $self->{debug_http};
+   $self->add_debug("$func: URL = $url" . "\n") if $self->{debug_http};
 
    my $req = POST $url,
        Content_Type => 'multipart/form-data',
        Content => [ file => [ $file ] ];
 
-   $self->add_debug("parse_resume: HTTP REQUEST:\n" . 
+   $self->add_debug("$func: HTTP REQUEST:\n" . 
                     $req->as_string . "\n") if $self->{debug_http};
    
    my $candidate = undef;
@@ -1683,13 +1914,13 @@ sub parse_resume {
 
       my $res = $self->{ua}->request($req);
 
-      $self->add_debug("parse_resume: HTTP RESPONSE:\n" . 
+      $self->add_debug("$func: HTTP RESPONSE:\n" . 
                        $res->as_string . "\n") if $self->{debug_http};
    
       if($res->is_success) {
          my $candidate_json = $res->content;
          
-         $self->add_debug("parse_resume: $candidate_json")
+         $self->add_debug("$func: $candidate_json")
              if $self->{debug_http};
          
          $candidate = $self->{json}->decode($candidate_json);
@@ -1697,32 +1928,16 @@ sub parse_resume {
          $success = 1;
 
          # If we had to retry, write a success msg to the error log
-         if($tries > 1) {
-            $self->add_error("parse_resume: successful on try $tries");
-         }
+         $self->add_error("$func: success on try $tries") if $tries > 1;
       }
       else {
-         $self->add_error("parse_resume: HTTP call failed");
-         $self->add_error("parse_resume: ". $res->status_line);
-         $self->add_error("parse_resume: try = $tries");
-
-         # If we don't already have this info in the debug log
-         # add it to the error log
-         if(! $self->{debug_http}) {
-            $self->add_error("parse_resume: HTTP REQUEST:\n" . 
-                             $req->as_string . "\n");
-            $self->add_error("parse_resume: HTTP RESPONSE:\n" . 
-                             $res->as_string . "\n");
-         }
-      
-         # Pause before trying again
-         sleep $self->{retry_wait} if $tries < $self->{retry_max};
+         $self->process_http_error($func, $req, $res, $tries);
       }
    }
    
 
    if( ! exists $candidate->{candidate} ) {
-      $self->add_error("parse_resume: Did not get candidate info");
+      $self->add_error("$func: Did not get candidate info");
    }
    
       
@@ -1739,7 +1954,8 @@ sub parse_resume {
 #
 # DESC:  Create an Entity
 #
-# https://rest5.bullhornstaffing.com/rest-services/abc123/entity/Candidate?
+# https://rest5.bullhornstaffing.com/rest-services/abc123/
+#     entity/Candidate?
 #     BhRestToken=74e6ae3b-b5c5-41d0-867f-f6b7a36f16cf
 #
 #  JSON Returned
@@ -1771,30 +1987,32 @@ sub parse_resume {
 sub create_entity {
    my ($self, $entity, $entity_href) = @_;
 
+   my $func = "create_entity";
+   
    if( $self->{login_href}->{restUrl} eq "") {
-      $self->add_error("create_entity: restUrl not defined");
+      $self->add_error("$func: restUrl not defined");
       return undef;
    }
 
    if( $self->{login_href}->{BhRestToken} eq "") {
-      $self->add_error("create_entity: BhRestToken not defined");
+      $self->add_error("$func: BhRestToken not defined");
       return undef;
    }
 
    if( $entity eq "") {
-      $self->add_error("create_entity: Entity not supplied");
+      $self->add_error("$func: Entity not supplied");
       return undef;
    }
 
    if( ref $entity_href ne "HASH") {
-      $self->add_error("create_entity: data needs to be hasf ref");
+      $self->add_error("$func: data needs to be hasf ref");
       return undef;
    }
 
 
    # Check if the access token needs to be refreshed
    if($self->check_access_token) {
-      $self->add_error("create_entity: Problem checking access token");
+      $self->add_error("$func: Problem checking access token");
       return undef;
    }
    
@@ -1805,15 +2023,15 @@ sub create_entity {
        $self->{login_href}->{restUrl} . qq(entity/$entity) . "?" .
        qq(BhRestToken=) . $self->{login_href}->{BhRestToken};
 
-   $self->add_debug("create_entity: URL = $url" . "\n") if $self->{debug_http};
+   $self->add_debug("$func: URL = $url" . "\n") if $self->{debug_http};
    
    my $req = HTTP::Request->new(PUT => $url);
 
    my $content_json = $self->{json}->pretty->encode($entity_href);
-   $self->add_debug("create_entity: $content_json") if $self->{debug_http};
+   $self->add_debug("$func: $content_json") if $self->{debug_http};
    $req->content($content_json);
 
-   $self->add_debug("create_entity: HTTP REQUEST:\n" . 
+   $self->add_debug("$func: HTTP REQUEST:\n" . 
                     $req->as_string . "\n") if $self->{debug_http};
    
 
@@ -1827,45 +2045,29 @@ sub create_entity {
 
       my $res = $self->{ua}->request($req);
 
-      $self->add_debug("create_entity: HTTP RESPONSE:\n" . 
+      $self->add_debug("$func: HTTP RESPONSE:\n" . 
                        $res->as_string . "\n") if $self->{debug_http};
       
       if($res->is_success) {
          my $create_json = $res->content;
          
-         $self->add_debug("create_entity: $create_json") if $self->{debug_http};
+         $self->add_debug("$func: $create_json") if $self->{debug_http};
          
          $create = $self->{json}->decode($create_json);
 
          $success = 1;
 
          # If we had to retry, write a success msg to the error log
-         if($tries > 1) {
-            $self->add_error("create_entity: successful on try $tries");
-         }
+         $self->add_error("$func: success on try $tries") if $tries > 1;
       }
       else {
-         $self->add_error("create_entity: HTTP call failed");
-         $self->add_error("create_entity: ". $res->status_line);
-         $self->add_error("create_entity: try = $tries");
-
-         # If we don't already have this info in the debug log
-         # add it to the error log
-         if(! $self->{debug_http}) {
-            $self->add_error("create_entity: HTTP REQUEST:\n" . 
-                             $req->as_string . "\n");
-            $self->add_error("create_entity: HTTP RESPONSE:\n" . 
-                             $res->as_string . "\n");
-         }
-         
-         # Pause before trying again
-         sleep $self->{retry_wait} if $tries < $self->{retry_max};
+         $self->process_http_error($func, $req, $res, $tries);
       }
    }
 
    
    if( ! exists $create->{changedEntityId} ) {
-      $self->add_error("create_entity: Did not get Entity ID back");
+      $self->add_error("$func: Did not get Entity ID back");
    }
 
 
@@ -1883,8 +2085,8 @@ sub create_entity {
 #
 # DESC:  Update an Entity
 #
-# https://rest5.bullhornstaffing.com/
-#     rest-services/abc123/entity/Candidate/121172?
+# https://rest5.bullhornstaffing.com/rest-services/abc123/
+#     entity/Candidate/121172?
 #     BhRestToken=74e6ae9c-b5c2-41d3-867f-f6b7a36f16ef
 #
 #  JSON Returned
@@ -1916,35 +2118,37 @@ sub create_entity {
 sub update_entity {
    my ($self, $entity, $id, $entity_href) = @_;
 
+   my $func = "update_entity";
+   
    if( $self->{login_href}->{restUrl} eq "") {
-      $self->add_error("update_entity: restUrl not defined");
+      $self->add_error("$func: restUrl not defined");
       return undef;
    }
 
    if( $self->{login_href}->{BhRestToken} eq "") {
-      $self->add_error("update_entity: BhRestToken not defined");
+      $self->add_error("$func: BhRestToken not defined");
       return undef;
    }
 
    if( $entity eq "") {
-      $self->add_error("update_entity: Entity not supplied");
+      $self->add_error("$func: Entity not supplied");
       return undef;
    }
 
    if( $id eq "") {
-      $self->add_error("update_entity: Entity ID not supplied");
+      $self->add_error("$func: Entity ID not supplied");
       return undef;
    }
    
    if( ref $entity_href ne "HASH") {
-      $self->add_error("update_entity: data needs to be hash ref");
+      $self->add_error("$func: data needs to be hash ref");
       return undef;
    }
 
 
    # Check if the access token needs to be refreshed
    if($self->check_access_token) {
-      $self->add_error("update_entity: Problem checking access token");
+      $self->add_error("$func: Problem checking access token");
       return undef;
    }
    
@@ -1955,17 +2159,17 @@ sub update_entity {
        $self->{login_href}->{restUrl} . qq(entity/$entity/$id) . "?" .
        qq(BhRestToken=) . $self->{login_href}->{BhRestToken};
 
-   $self->add_debug("update_entity: URL = $url" . "\n") if $self->{debug_http};
+   $self->add_debug("$func: URL = $url" . "\n") if $self->{debug_http};
    
    my $req = HTTP::Request->new(POST => $url);
 
    my $content_json = $self->{json}->pretty->encode($entity_href);
-   $self->add_debug("update_entity: $content_json") if $self->{debug_http};
+   $self->add_debug("$func: $content_json") if $self->{debug_http};
    $req->content_type("text/plain; charset='utf8'");
    $req->content(Encode::encode_utf8($content_json));
    #$req->content($content_json);
 
-   $self->add_debug("update_entity: HTTP REQUEST:\n" . 
+   $self->add_debug("$func: HTTP REQUEST:\n" . 
                     $req->as_string . "\n") if $self->{debug_http};
    
 
@@ -1978,45 +2182,29 @@ sub update_entity {
    
       my $res = $self->{ua}->request($req);
 
-      $self->add_debug("update_entity: HTTP RESPONSE:\n" . 
+      $self->add_debug("$func: HTTP RESPONSE:\n" . 
                        $res->as_string . "\n") if $self->{debug_http};
       
       if($res->is_success) {
          my $update_json = $res->content;
          
-         $self->add_debug("update_entity: $update_json") if $self->{debug_http};
+         $self->add_debug("$func: $update_json") if $self->{debug_http};
          
          $update = $self->{json}->decode($update_json);
 
          $success = 1;
 
          # If we had to retry, write a success msg to the error log
-         if($tries > 1) {
-            $self->add_error("update_entity: successful on try $tries");
-         }
+         $self->add_error("$func: success on try $tries") if $tries > 1;
       }
       else {
-         $self->add_error("update_entity: HTTP call failed");
-         $self->add_error("update_entity: ". $res->status_line);
-         $self->add_error("update_entity: try = $tries");
-
-         # If we don't already have this info in the debug log
-         # add it to the error log
-         if(! $self->{debug_http}) {
-            $self->add_error("update_entity: HTTP REQUEST:\n" . 
-                             $req->as_string . "\n");
-            $self->add_error("update_entity: HTTP RESPONSE:\n" . 
-                             $res->as_string . "\n");
-         }
-      
-         # Pause before trying again
-         sleep $self->{retry_wait} if $tries < $self->{retry_max};
+         $self->process_http_error($func, $req, $res, $tries);
       }
    }
    
    
    if( ! exists $update->{changedEntityId} ) {
-      $self->add_error("update_entity: Did not get Entity ID back");
+      $self->add_error("$func: Did not get Entity ID back");
    }
 
 
@@ -2034,8 +2222,8 @@ sub update_entity {
 #        This will only perform a Soft Delete which sets the
 #        isDeleted property to true
 #
-# https://rest5.bullhornstaffing.com/
-#     rest-services/abc123/entity/Candidate/121172?
+# https://rest5.bullhornstaffing.com/rest-services/abc123/
+#     entity/Candidate/121172?
 #     BhRestToken=74e6ae9b-b5c6-41d0-867f-f6b7a36f16ef
 #
 #  JSON Returned
@@ -2063,30 +2251,32 @@ sub update_entity {
 sub delete_entity {
    my ($self, $entity, $id, $undel) = @_;
 
+   my $func = "delete_entity";
+   
    if( $self->{login_href}->{restUrl} eq "") {
-      $self->add_error("delete_entity: restUrl not defined");
+      $self->add_error("$func: restUrl not defined");
       return undef;
    }
 
    if( $self->{login_href}->{BhRestToken} eq "") {
-      $self->add_error("delete_entity: BhRestToken not defined");
+      $self->add_error("$func: BhRestToken not defined");
       return undef;
    }
 
    if( $entity eq "") {
-      $self->add_error("delete_entity: Entity not supplied");
+      $self->add_error("$func: Entity not supplied");
       return undef;
    }
 
    if( $id eq "") {
-      $self->add_error("delete_entity: Entity ID not supplied");
+      $self->add_error("$func: Entity ID not supplied");
       return undef;
    }
    
 
    # Check if the access token needs to be refreshed
    if($self->check_access_token) {
-      $self->add_error("delete_entity: Problem checking access token");
+      $self->add_error("$func: Problem checking access token");
       return undef;
    }
 
@@ -2106,17 +2296,17 @@ sub delete_entity {
        $self->{login_href}->{restUrl} . qq(entity/$entity/$id) . "?" .
        qq(BhRestToken=) . $self->{login_href}->{BhRestToken};
 
-   $self->add_debug("delete_entity: URL = $url" . "\n") if $self->{debug_http};
+   $self->add_debug("$func: URL = $url" . "\n") if $self->{debug_http};
    
    my $req = HTTP::Request->new(POST => $url);
 
    my $content_json = 
        $self->{json}->pretty->encode( { isDeleted => $undel } );
 
-   $self->add_debug("delete_entity: $content_json") if $self->{debug_http};
+   $self->add_debug("$func: $content_json") if $self->{debug_http};
    $req->content($content_json);
 
-   $self->add_debug("delete_entity: HTTP REQUEST:\n" . 
+   $self->add_debug("$func: HTTP REQUEST:\n" . 
                     $req->as_string . "\n") if $self->{debug_http};
    
 
@@ -2129,45 +2319,29 @@ sub delete_entity {
 
       my $res = $self->{ua}->request($req);
 
-      $self->add_debug("delete_entity: HTTP RESPONSE:\n" . 
+      $self->add_debug("$func: HTTP RESPONSE:\n" . 
                        $res->as_string . "\n") if $self->{debug_http};
    
       if($res->is_success) {
          my $del_json = $res->content;
          
-         $self->add_debug("delete_entity: $del_json") if $self->{debug_http};
+         $self->add_debug("$func: $del_json") if $self->{debug_http};
          
          $del = $self->{json}->decode($del_json);
 
          $success = 1;
 
          # If we had to retry, write a success msg to the error log
-         if($tries > 1) {
-            $self->add_error("delete_entity: successful on try $tries");
-         }
+         $self->add_error("$func: success on try $tries") if $tries > 1;
       }
       else {
-         $self->add_error("delete_entity: HTTP call failed");
-         $self->add_error("delete_entity: ". $res->status_line);
-         $self->add_error("delete_entity: try = $tries");
-
-         # If we don't already have this info in the debug log
-         # add it to the error log
-         if(! $self->{debug_http}) {
-            $self->add_error("delete_entity: HTTP REQUEST:\n" . 
-                             $req->as_string . "\n");
-            $self->add_error("delete_entity: HTTP RESPONSE:\n" . 
-                             $res->as_string . "\n");
-         }
-      
-         # Pause before trying again
-         sleep $self->{retry_wait} if $tries < $self->{retry_max};
+         $self->process_http_error($func, $req, $res, $tries);
       }
    }
 
    
    if( ! exists $del->{changedEntityId} ) {
-      $self->add_error("delete_entity: Did not get Entity ID back");
+      $self->add_error("$func: Did not get Entity ID back");
    }
 
 
@@ -2185,7 +2359,8 @@ sub delete_entity {
 #
 # DESC:  Attach a file to an Entity
 #
-# https://rest5.bullhornstaffing.com/rest-services/abc123/Candidate/<ENTITYID>?
+# https://rest5.bullhornstaffing.com/rest-services/abc123/
+#     Candidate/<ENTITYID>?
 #     BhRestToken=74e6ae9b-b7c2-41d0-827f-f6b7a36f16ef
 #
 #  JSON Returned
@@ -2226,38 +2401,40 @@ sub attach_file {
    my ( $self, $entity, $entity_id, $file, $extern_id, $name,
         $descr, $mime_type, $type ) = @_;
 
+   my $func = "attach_file";
+   
    if( $self->{login_href}->{restUrl} eq "" ) {
-      $self->add_error("attach_file: restUrl not defined");
+      $self->add_error("$func: restUrl not defined");
       return undef;
    }
 
    if( $self->{login_href}->{BhRestToken} eq "" ) {
-      $self->add_error("attach_file: BhRestToken not defined");
+      $self->add_error("$func: BhRestToken not defined");
       return undef;
    }
 
    if( $entity eq "" ) {
-      $self->add_error("attach_file: Entity not supplied");
+      $self->add_error("$func: Entity not supplied");
       return undef;
    }
 
    if( $entity_id eq "" ) {
-      $self->add_error("attach_file: Entity ID not supplied");
+      $self->add_error("$func: Entity ID not supplied");
       return undef;
    }
 
    if( $file eq "" ) {
-      $self->add_error("attach_file: File not supplied");
+      $self->add_error("$func: File not supplied");
       return undef;
    }
 
    if( ! -f $file ) {
-      $self->add_error("attach_file: File not found");
+      $self->add_error("$func: File not found");
       return undef;
    }
 
    if( $extern_id eq "" ) {
-      $self->add_error("attach_file: External ID not supplied");
+      $self->add_error("$func: External ID not supplied");
       return undef;
    }
 
@@ -2279,12 +2456,12 @@ sub attach_file {
       close FH;
    }
    else {
-      $self->add_error("attach_file: Problem opening '$file' to get base64");
+      $self->add_error("$func: Problem opening '$file' to get base64");
       return undef;
    }
    
    if( $f64 eq "" ) {
-      $self->add_error("attach_file: Did not get base64 for '$file'");
+      $self->add_error("$func: Did not get base64 for '$file'");
       return undef;
    }
    
@@ -2308,7 +2485,7 @@ sub attach_file {
 
    # Check if the access token needs to be refreshed
    if($self->check_access_token) {
-      $self->add_error("attach_file: Problem checking access token");
+      $self->add_error("$func: Problem checking access token");
       return undef;
    }
 
@@ -2316,18 +2493,19 @@ sub attach_file {
    my $attach = undef;
    
    my $url = 
-       $self->{login_href}->{restUrl} . qq(file/$entity/$entity_id) . "?" .
+       $self->{login_href}->{restUrl} .
+       qq(file/$entity/$entity_id) . "?" .
        qq(BhRestToken=) . $self->{login_href}->{BhRestToken};
 
-   $self->add_debug("attach_file: URL = $url" . "\n") if $self->{debug_http};
+   $self->add_debug("$func: URL = $url" . "\n") if $self->{debug_http};
    
    my $req = HTTP::Request->new(PUT => $url);
 
    my $debug_json = $self->{json}->pretty->encode($f2);
-   $self->add_debug("attach_file: $debug_json") if $self->{debug_http};
+   $self->add_debug("$func: $debug_json") if $self->{debug_http};
    $req->content( $self->{json}->encode($f) );
 
-   $self->add_debug("attach_file: HTTP REQUEST:\n" . 
+   $self->add_debug("$func: HTTP REQUEST:\n" . 
                     $req->as_string . "\n") if $self->{debug_http};
 
 
@@ -2340,45 +2518,29 @@ sub attach_file {
    
       my $res = $self->{ua}->request($req);
 
-      $self->add_debug("attach_file: HTTP RESPONSE:\n" . 
+      $self->add_debug("$func: HTTP RESPONSE:\n" . 
                        $res->as_string . "\n") if $self->{debug_http};
       
       if($res->is_success) {
          my $attach_json = $res->content;
          
-         $self->add_debug("attach_file: $attach_json") if $self->{debug_http};
+         $self->add_debug("$func: $attach_json") if $self->{debug_http};
          
          $attach = $self->{json}->decode($attach_json);
 
          $success = 1;
 
          # If we had to retry, write a success msg to the error log
-         if($tries > 1) {
-            $self->add_error("attach_file: successful on try $tries");
-         }
+         $self->add_error("$func: success on try $tries") if $tries > 1;
       }
       else {
-         $self->add_error("attach_file: HTTP call failed");
-         $self->add_error("attach_file: ". $res->status_line);
-         $self->add_error("attach_file: try = $tries");
-
-         # If we don't already have this info in the debug log
-         # add it to the error log
-         if(! $self->{debug_http}) {
-            $self->add_error("attach_file: HTTP REQUEST:\n" . 
-                             $req->as_string . "\n");
-            $self->add_error("attach_file: HTTP RESPONSE:\n" . 
-                             $res->as_string . "\n");
-         }
-      
-         # Pause before trying again
-         sleep $self->{retry_wait} if $tries < $self->{retry_max};
+         $self->process_http_error($func, $req, $res, $tries);
       }
    }
 
    
    if( ! exists $attach->{fileId} ) {
-      $self->add_error("attach_file: Did not get File ID back");
+      $self->add_error("$func: Did not get File ID back");
    }
 
 
@@ -2422,40 +2584,42 @@ sub attach_file {
 sub put_subscription {
    my ($self, $subid, $type, $names, $eventTypes) = @_;
 
+   my $func = "put_subscription";
+   
    if( $self->{login_href}->{restUrl} eq "") {
-      $self->add_error("put_subscription: restUrl not defined");
+      $self->add_error("$func: restUrl not defined");
       return undef;
    }
 
    if( $self->{login_href}->{BhRestToken} eq "") {
-      $self->add_error("put_subscription: BhRestToken not defined");
+      $self->add_error("$func: BhRestToken not defined");
       return undef;
    }
 
    if( $subid eq "") {
-      $self->add_error("put_subscription: subid not defined");
+      $self->add_error("$func: subid not defined");
       return undef;
    }
 
    if( $type eq "") {
-      $self->add_error("put_subscription: type not defined");
+      $self->add_error("$func: type not defined");
       return undef;
    }
 
    if( $names eq "") {
-      $self->add_error("put_subscription: names not defined");
+      $self->add_error("$func: names not defined");
       return undef;
    }
 
    if( $eventTypes eq "") {
-      $self->add_error("put_subscription: eventTypes not defined");
+      $self->add_error("$func: eventTypes not defined");
       return undef;
    }
 
 
    # Check if the access token needs to be refreshed
    if($self->check_access_token) {
-      $self->add_error("put_subscription: Problem checking access token");
+      $self->add_error("$func: Problem checking access token");
       return undef;
    }
 
@@ -2463,18 +2627,19 @@ sub put_subscription {
    my $putsub = undef;
    
    my $url = 
-       $self->{login_href}->{restUrl} . qq(event/subscription/$subid) . "?" .
+       $self->{login_href}->{restUrl} .
+       qq(event/subscription/$subid) . "?" .
        qq(BhRestToken=) . $self->{login_href}->{BhRestToken} . "&" .
        qq(type=$type)                                        . "&" .
        qq(names=$names)                                      . "&" .
        qq(eventTypes=$eventTypes);
 
-   $self->add_debug("put_subscription: URL = $url" . "\n")
+   $self->add_debug("$func: URL = $url" . "\n")
        if $self->{debug_http};
    
    my $req = HTTP::Request->new(PUT => $url);
 
-   $self->add_debug("put_subscription: HTTP REQUEST:\n" . 
+   $self->add_debug("$func: HTTP REQUEST:\n" . 
                     $req->as_string . "\n") if $self->{debug_http};
 
 
@@ -2487,13 +2652,13 @@ sub put_subscription {
       
       my $res = $self->{ua}->request($req);
       
-      $self->add_debug("put_subscription: HTTP RESPONSE:\n" . 
+      $self->add_debug("$func: HTTP RESPONSE:\n" . 
                        $res->as_string . "\n") if $self->{debug_http};
       
       if($res->is_success) {
          my $putsub_json = $res->content;
          
-         $self->add_debug("put_subscription: $putsub_json")
+         $self->add_debug("$func: $putsub_json")
              if $self->{debug_http};
          
          $putsub = $self->{json}->decode($putsub_json);
@@ -2501,32 +2666,16 @@ sub put_subscription {
          $success = 1;
 
          # If we had to retry, write a success msg to the error log
-         if($tries > 1) {
-            $self->add_error("put_subscription: successful on try $tries");
-         }
+         $self->add_error("$func: success on try $tries") if $tries > 1;
       }
       else {
-         $self->add_error("put_subscription: HTTP call failed");
-         $self->add_error("put_subscription: ". $res->status_line);
-         $self->add_error("put_subscription: try = $tries");
-
-         # If we don't already have this info in the debug log
-         # add it to the error log
-         if(! $self->{debug_http}) {
-            $self->add_error("put_subscription: HTTP REQUEST:\n" . 
-                             $req->as_string . "\n");
-            $self->add_error("put_subscription: HTTP RESPONSE:\n" . 
-                             $res->as_string . "\n");
-         }
-      
-         # Pause before trying again
-         sleep $self->{retry_wait} if $tries < $self->{retry_max};
+         $self->process_http_error($func, $req, $res, $tries);
       }
    }
    
    
    #if( ! exists $search->{total} ) {
-   #   $self->add_error("put_subscription: Did not get search info");
+   #   $self->add_error("$func: Did not get search info");
    #}
 
 
@@ -2563,7 +2712,8 @@ sub put_subscription {
 #                                    ],
 #            'eventMetadata' => {
 #                     'PERSON_ID' => '123002',
-#                     'TRANSACTION_ID' => '0e05f5b4-dbcb-4bca-b096-0c535c0e27cf'
+#                     'TRANSACTION_ID' =>
+#                             '0e05f5b4-dbcb-4bca-b096-0c535c0e27cf'
 #                                },
 #            'entityName' => 'Candidate',
 #            'entityEventType' => 'UPDATED',
@@ -2586,30 +2736,32 @@ sub put_subscription {
 sub get_subscription {
    my ($self, $subid, $maxEvents, $reqid) = @_;
 
+   my $func = "get_subscription";
+   
    if( $self->{login_href}->{restUrl} eq "") {
-      $self->add_error("get_subscription: restUrl not defined");
+      $self->add_error("$func: restUrl not defined");
       return undef;
    }
 
    if( $self->{login_href}->{BhRestToken} eq "") {
-      $self->add_error("get_subscription: BhRestToken not defined");
+      $self->add_error("$func: BhRestToken not defined");
       return undef;
    }
 
    if( $subid eq "") {
-      $self->add_error("get_subscription: subid not defined");
+      $self->add_error("$func: subid not defined");
       return undef;
    }
 
    if( $maxEvents eq "") {
-      $self->add_error("get_subscription: maxEvents not defined");
+      $self->add_error("$func: maxEvents not defined");
       return undef;
    }
 
 
    # Check if the access token needs to be refreshed
    if($self->check_access_token) {
-      $self->add_error("get_subscription: Problem checking access token");
+      $self->add_error("$func: Problem checking access token");
       return undef;
    }
 
@@ -2617,19 +2769,20 @@ sub get_subscription {
    my $getsub = undef;
    
    my $url = 
-       $self->{login_href}->{restUrl} . qq(event/subscription/$subid) . "?" .
+       $self->{login_href}->{restUrl} .
+       qq(event/subscription/$subid) . "?" .
        qq(BhRestToken=) . $self->{login_href}->{BhRestToken} . "&" .
        qq(maxEvents=$maxEvents);
 
    $url .= "&" . qq(requestId=$reqid) if ($reqid ne "") || ($reqid > 0);
 
    
-   $self->add_debug("get_subscription: URL = $url" . "\n")
+   $self->add_debug("$func: URL = $url" . "\n")
        if $self->{debug_http};
    
    my $req = HTTP::Request->new(GET => $url);
 
-   $self->add_debug("get_subscription: HTTP REQUEST:\n" . 
+   $self->add_debug("$func: HTTP REQUEST:\n" . 
                     $req->as_string . "\n") if $self->{debug_http};
    
 
@@ -2642,40 +2795,25 @@ sub get_subscription {
 
       my $res = $self->{ua}->request($req);
 
-      $self->add_debug("get_subscription: HTTP RESPONSE:\n" . 
+      $self->add_debug("$func: HTTP RESPONSE:\n" . 
                        $res->as_string . "\n") if $self->{debug_http};
       
       if($res->is_success) {
          my $getsub_json = $res->content;
          
-         $self->add_debug("get_subscription: $getsub_json")
+         $self->add_debug("$func: $getsub_json")
              if $self->{debug_http};
          
-         $getsub = $self->{json}->decode($getsub_json) if $getsub_json ne "";
+         $getsub = $self->{json}->decode($getsub_json)
+             if $getsub_json ne "";
 
          $success = 1;
 
          # If we had to retry, write a success msg to the error log
-         if($tries > 1) {
-            $self->add_error("get_subscription: successful on try $tries");
-         }
+         $self->add_error("$func: success on try $tries") if $tries > 1;
       }
       else {
-         $self->add_error("get_subscription: HTTP call failed");
-         $self->add_error("get_subscription: ". $res->status_line);
-         $self->add_error("get_subscription: try = $tries");
-
-         # If we don't already have this info in the debug log
-         # add it to the error log
-         if(! $self->{debug_http}) {
-            $self->add_error("get_subscription: HTTP REQUEST:\n" . 
-                             $req->as_string . "\n");
-            $self->add_error("get_subscription: HTTP RESPONSE:\n" . 
-                             $res->as_string . "\n");
-         }
-      
-         # Pause before trying again
-         sleep $self->{retry_wait} if $tries < $self->{retry_max};
+         $self->process_http_error($func, $req, $res, $tries);
       }
    }
 
@@ -2712,25 +2850,27 @@ sub get_subscription {
 sub delete_subscription {
    my ($self, $subid) = @_;
 
+   my $func = "delete_subscription";
+   
    if( $self->{login_href}->{restUrl} eq "") {
-      $self->add_error("delete_subscription: restUrl not defined");
+      $self->add_error("$func: restUrl not defined");
       return undef;
    }
 
    if( $self->{login_href}->{BhRestToken} eq "") {
-      $self->add_error("delete_subscription: BhRestToken not defined");
+      $self->add_error("$func: BhRestToken not defined");
       return undef;
    }
 
    if( $subid eq "") {
-      $self->add_error("delete_subscription: subid not defined");
+      $self->add_error("$func: subid not defined");
       return undef;
    }
 
 
    # Check if the access token needs to be refreshed
    if($self->check_access_token) {
-      $self->add_error("delete_subscription: Problem checking access token");
+      $self->add_error("$func: Problem checking access token");
       return undef;
    }
 
@@ -2738,18 +2878,18 @@ sub delete_subscription {
    my $delsub = undef;
    
    my $url = 
-       $self->{login_href}->{restUrl} . qq(event/subscription/$subid) . "?" .
+       $self->{login_href}->{restUrl} .
+       qq(event/subscription/$subid) . "?" .
        qq(BhRestToken=) . $self->{login_href}->{BhRestToken};
 
    
-   $self->add_debug("delete_subscription: URL = $url" . "\n")
+   $self->add_debug("$func: URL = $url" . "\n")
        if $self->{debug_http};
    
    my $req = HTTP::Request->new(DELETE => $url);
 
-   $self->add_debug("delete_subscription: HTTP REQUEST:\n" . 
+   $self->add_debug("$func: HTTP REQUEST:\n" . 
                     $req->as_string . "\n") if $self->{debug_http};
-
 
    
    my $success = 0;
@@ -2761,50 +2901,31 @@ sub delete_subscription {
 
       my $res = $self->{ua}->request($req);
 
-      $self->add_debug("delete_subscription: HTTP RESPONSE:\n" . 
+      $self->add_debug("$func: HTTP RESPONSE:\n" . 
                        $res->as_string . "\n") if $self->{debug_http};
       
       if($res->is_success) {
          my $delsub_json = $res->content;
          
-         $self->add_debug("delete_subscription: $delsub_json")
+         $self->add_debug("$func: $delsub_json")
              if $self->{debug_http};
          
-         $delsub = $self->{json}->decode($delsub_json) if $delsub_json ne "";
+         $delsub = $self->{json}->decode($delsub_json)
+             if $delsub_json ne "";
          
          $success = 1;
 
          # If we had to retry, write a success msg to the error log
-         if($tries > 1) {
-            $self->add_error("delete_subscription: successful on try $tries");
-         }
+         $self->add_error("$func: success on try $tries") if $tries > 1;
       }
       else {
-         $self->add_error("delete_subscription: HTTP call failed");
-         $self->add_error("delete_subscription: ". $res->status_line);
-         $self->add_error("delete_subscription: try = $tries");
-
-         # If we don't already have this info in the debug log
-         # add it to the error log
-         if(! $self->{debug_http}) {
-            $self->add_error("delete_subscription: HTTP REQUEST:\n" . 
-                             $req->as_string . "\n");
-            $self->add_error("delete_subscription: HTTP RESPONSE:\n" . 
-                             $res->as_string . "\n");
-         }
-      
-         # Pause before trying again
-         sleep $self->{retry_wait} if $tries < $self->{retry_max};
+         $self->process_http_error($func, $req, $res, $tries);
       }
    }
 
    
    return $delsub;
 }
-
-
-
-
 
 
 
@@ -2836,11 +2957,11 @@ sub ts_epoch_now {
 }
 
 sub ts_lucene_now {
-   return $_[0]->ts_epoch_to_lucene(localtime(time));
+   return $_[0]->ts_epoch_to_lucene(time*1000);
 }
 
 sub ts_mysql_now {
-   return $_[0]->ts_epoch_to_mysql(localtime(time));
+   return $_[0]->ts_epoch_to_mysql(time*1000);
 }
 
 sub ts_epoch_to_mysql {
@@ -2891,6 +3012,62 @@ sub get_datetime {
    my @d = localtime(time);
    return sprintf("%04d%02d%02d%02d%02d%02d",
                   $d[5]+1900, $d[4]+1, $d[3], $d[2], $d[1], $d[0]);
+}
+
+
+
+
+#----------------------------------------------------------------------
+#
+# NAME:  process_http_error
+#
+# DESC:  Process HTTP Errors
+#
+# ARGS:  self    Bullhorn Object
+#        func    Function Name
+#        req     HTTP::Request Object
+#        req     HTTP::Response Object
+#        tries   Number of tries attempted
+#                This can be 0 if multiple attempts are not made
+#
+# RETN:  
+#
+# HIST:  
+#
+#----------------------------------------------------------------------
+sub process_http_error {
+   my ($self, $func, $req, $res, $tries) = @_;
+
+   $self->add_error("$func: HTTP call failed");
+   $self->add_error("$func: ". $res->status_line);
+   $self->add_error("$func: try = $tries");
+
+   
+   # If we don't have this info in the debug log
+   # add it to the error log
+   if( ! $self->{debug_http} ) {
+      $self->add_error("$func: HTTP REQUEST:\n" .$req->as_string."\n");
+      $self->add_error("$func: HTTP RESPONSE:\n".$res->as_string."\n");
+   }
+
+
+   if( $tries > 0 ) {
+
+      # Pause before trying again
+      sleep $self->{retry_wait} if $tries < $self->{retry_max};
+
+
+      # Check for Unauthorized in the response
+      if( $res->code == 401 ) {
+         $self->add_error("$func: WARNING: CHECK/REFRESH TOKEN\n");
+         
+      }
+      # Redirection means to use a different URL     
+      elsif( $res->code == 307 ) {
+         $self->add_error("$func: WARNING: REDIRECTION\n");
+         
+      }
+   }
 }
 
 
