@@ -100,7 +100,7 @@ sub new {
    #------------------------------------------------------------
    # JSON object
    #------------------------------------------------------------   
-   my $json = JSON->new->allow_nonref;
+   my $json = JSON->new->allow_nonref->utf8;
 
    $d->{json} = $json;
 
@@ -2166,8 +2166,8 @@ sub update_entity {
    my $content_json = $self->{json}->pretty->encode($entity_href);
    $self->add_debug("$func: $content_json") if $self->{debug_http};
    $req->content_type("text/plain; charset='utf8'");
-   $req->content(Encode::encode_utf8($content_json));
-   #$req->content($content_json);
+   #$req->content(Encode::encode_utf8($content_json));
+   $req->content($content_json);
 
    $self->add_debug("$func: HTTP REQUEST:\n" . 
                     $req->as_string . "\n") if $self->{debug_http};
